@@ -27,43 +27,43 @@
 static struct notifier_block thunder_state_notif;
 #endif
 
-#define DEBUG				0
-
-#define THUNDERPLUG			"thunderplug"
-
-#define DRIVER_VERSION			5
-#define DRIVER_SUBVER			3
-
-#define DEFAULT_CPU_LOAD_THRESHOLD	(80)
-#define MIN_CPU_LOAD_THRESHOLD		(10)
-
-#define HOTPLUG_ENABLED			(0)
-#define STARTDELAY			1000
-
-#define DEF_SAMPLING_MS			(50)
-#define MIN_SAMLING_MS			(10)
-#define MIN_CPU_UP_TIME			(750)
+#define THUNDERPLUG				"thunderplug"
+#define DRIVER_VERSION				5
+#define DRIVER_SUBVER					4
+#define START_DELAY				HZ * 10
+#define DOWN_LOCK_DUR				HZ * 20
+#define HOTPLUG_ENABLED				(0)
+#define DEFAULT_CPU_LOAD_THRESHOLD		(90)
+#define DEFAULT_SAMPLING_MS			(20)
+#define MIN_CPU_UP_TIME				(300)
+#define MIN_SAMPLING_MS				(10)
 
 static bool isSuspended = false;
 
-static int suspend_cpu_num = 3, resume_cpu_num = (NR_CPUS -1);
 static int max_core_online = NR_CPUS;
 static int min_core_online = 1;
-
 static int now[8], last_time[8];
-
-static int sampling_time = DEF_SAMPLING_MS;
+static int sampling_time = DEFAULT_SAMPLING_MS;
 static int load_threshold = DEFAULT_CPU_LOAD_THRESHOLD;
-
-struct cpufreq_policy old_policy[NR_CPUS];
-
 static int tplug_hp_enabled = HOTPLUG_ENABLED;
 static int hotplug_suspend = 0;
+
+struct cpufreq_policy old_policy[NR_CPUS];
 
 static struct workqueue_struct *tplug_wq;
 static struct delayed_work tplug_work;
 
 static unsigned int last_load[8] = { 0 };
+static unsigned int down_lock_dur = DOWN_LOCK_DUR;
+
+static unsigned int debug;
+module_param_named(debug_mask, debug, uint, 0644);
+
+#define dprintk(msg...)		\
+do { 				\
+	if (debug)		\
+		pr_info(msg);	\
+} while (0)
 
 struct cpu_load_data {
 	u64 prev_cpu_idle;
@@ -74,35 +74,63 @@ struct cpu_load_data {
 	unsigned int window_size;
 	cpumask_var_t related_cpus;
 };
-
 static DEFINE_PER_CPU(struct cpu_load_data, cpuload);
 
-static inline void offline_cpus(void)
-{
-	unsigned int cpu;
+struct down_lock {
+	unsigned int locked;
+	struct delayed_work lock_rem;
+};
+static DEFINE_PER_CPU(struct down_lock, lock_info);
 
-	for (cpu = NR_CPUS - 1; cpu > (suspend_cpu_num - 1); cpu--) {
-		if (cpu_online(cpu))
-			cpu_down(cpu);
-	}
-	pr_info("%s: %d cpus were offlined\n",
-			THUNDERPLUG, (NR_CPUS - suspend_cpu_num));
+static void apply_down_lock(unsigned int cpu)
+{
+	struct down_lock *dl = &per_cpu(lock_info, cpu);
+
+	dl->locked = 1;
+	queue_delayed_work_on(0, tplug_wq, &dl->lock_rem,
+			      msecs_to_jiffies(down_lock_dur));
 }
 
-static inline void cpus_online_all(void)
+static void remove_down_lock(struct work_struct *work)
+{
+	struct down_lock *dl = container_of(work, struct down_lock,
+					    lock_rem.work);
+	dl->locked = 0;
+}
+
+static inline void cpus_bring_offline(unsigned int sus)
 {
 	unsigned int cpu;
 
-	if (DEBUG)
-		pr_info("%s: resume_cpu_num = %d\n",THUNDERPLUG,
-				resume_cpu_num);
-
-	for (cpu = 1; cpu <= resume_cpu_num; cpu++) {
-		if (cpu_is_offline(cpu))
-			cpu_up(cpu);
+	/* Put cores to sleep */
+	for_each_online_cpu(cpu) {
+		if (sus)
+			if (cpu == 0 || cpu == 1)
+				continue;
+		else
+			if (cpu == 0)
+				continue;
+		cpu_down(cpu);
 	}
+	dprintk("%s: cpus were offlined\n", THUNDERPLUG);
+}
 
-	pr_info("%s: all cpus were onlined\n", THUNDERPLUG);
+static inline void cpus_bring_online(unsigned int sus)
+{
+	unsigned int cpu;
+
+	/* Fire up sleeping cores */
+	for_each_cpu_not(cpu, cpu_online_mask) {
+		if (sus)
+			if (cpu == 0 || cpu == 1)
+				continue;
+		else
+			if (cpu == 0)
+				continue;
+		cpu_up(cpu);
+		apply_down_lock(cpu);
+	}
+	dprintk("%s: cpus were onlined\n", THUNDERPLUG);
 }
 
 static ssize_t thunderplug_hotplug_suspend_show(struct kobject *kobj,
@@ -125,33 +153,11 @@ static ssize_t thunderplug_hotplug_suspend_store(struct kobject *kobj,
 			hotplug_suspend = val;
 			break;
 		default:
-			pr_info("%s: invalid hotplug_suspend value use 1 or 0\n",
+			dprintk("%s: invalid hotplug_suspend value use 1 or 0\n",
 					THUNDERPLUG);
 			hotplug_suspend = 0;
 			break;
 	}
-	return count;
-}
-
-static ssize_t thunderplug_suspend_cpus_show(struct kobject *kobj,
-			struct kobj_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%d", suspend_cpu_num);
-}
-
-static ssize_t thunderplug_suspend_cpus_store(struct kobject *kobj,
-			struct kobj_attribute *attr,
-			const char *buf, size_t count)
-{
-	int val;
-
-	sscanf(buf, "%d", &val);
-
-	if (val < 1 || val > NR_CPUS)
-		pr_info("%s: suspend cpus off-limits\n", THUNDERPLUG);
-	else
-		suspend_cpu_num = val;
-
 	return count;
 }
 
@@ -176,8 +182,8 @@ static ssize_t __ref thunderplug_max_core_online_store(struct kobject *kobj,
 		case 4:
 			if (tplug_hp_enabled && max_core_online != val) {
 				max_core_online = val;
-				offline_cpus();
-				cpus_online_all();
+				cpus_bring_offline(0);
+				cpus_bring_online(0);
 			}
 			break;
 		default:
@@ -209,8 +215,8 @@ static ssize_t __ref thunderplug_min_core_online_store(struct kobject *kobj,
 		case 4:
 			if (tplug_hp_enabled && min_core_online != val) {
 				min_core_online = val;
-				offline_cpus();
-				cpus_online_all();
+				cpus_bring_offline(0);
+				cpus_bring_online(0);
 			}
 			break;
 		default:
@@ -235,7 +241,7 @@ static ssize_t thunderplug_sampling_store(struct kobject *kobj,
 
 	sscanf(buf, "%d", &val);
 
-	if (val > MIN_SAMLING_MS)
+	if (val >= MIN_SAMPLING_MS)
 		sampling_time = val;
 
 	return count;
@@ -315,18 +321,14 @@ static void __cpuinit tplug_work_fn(struct work_struct *work)
 	for (i = 0 ; i < max_core_online - 1; i++) {
 		if (cpu_online(i) && avg_load[i] >
 				load_threshold && cpu_is_offline(i + 1)) {
-			if (DEBUG)
-				pr_info("%s : bringing back cpu%d\n",
-					THUNDERPLUG,i);
+			dprintk("%s : bringing back cpu%d\n", THUNDERPLUG, i);
 			if (!((i + 1) > 7)) {
 				last_time[i + 1] = ktime_to_ms(ktime_get());
 				cpu_up(i + 1);
 			}
 		} else if (cpu_online(i) && avg_load[i] <
 				load_threshold && cpu_online(i + 1)) {
-			if (DEBUG)
-				pr_info("%s : offlining cpu%d\n",
-					THUNDERPLUG,i);
+			dprintk("%s : offlining cpu%d\n", THUNDERPLUG, i);
 			if (nr_cpu_online > min_core_online) {
 				if (!(i + 1) == 0) {
 					now[i + 1] = ktime_to_ms(ktime_get());
@@ -344,20 +346,19 @@ static void __cpuinit tplug_work_fn(struct work_struct *work)
 #ifdef CONFIG_STATE_NOTIFIER
 static void __ref thunderplug_suspend(void)
 {
-	if (isSuspended == false) {
+	if (!isSuspended) {
 		isSuspended = true;
+		flush_workqueue(tplug_wq);
 		cancel_delayed_work_sync(&tplug_work);
-		offline_cpus();
-		pr_info("%s: suspend\n", THUNDERPLUG);
+		cpus_bring_offline(1);
 	}
 }
 
 static void __ref thunderplug_resume(void)
 {
-	if (isSuspended == true) {
+	if (isSuspended) {
 		isSuspended = false;
-		cpus_online_all();
-		pr_info("%s: resume\n", THUNDERPLUG);
+		cpus_bring_online(1);
 		queue_delayed_work_on(0, tplug_wq, &tplug_work,
 				msecs_to_jiffies(sampling_time));
 	}
@@ -366,10 +367,7 @@ static void __ref thunderplug_resume(void)
 static int state_notifier_callback(struct notifier_block *this,
 				unsigned long event, void *data)
 {
-	if (!hotplug_suspend)
-		return NOTIFY_OK;
-
-	if (!tplug_hp_enabled)
+	if (!hotplug_suspend || !tplug_hp_enabled)
 		return NOTIFY_OK;
 
 	switch (event) {
@@ -412,29 +410,13 @@ static ssize_t __ref thunderplug_hp_enabled_store(struct kobject *kobj,
 	}
 
 	if (tplug_hp_enabled == 1 && !last_val) {
-		pr_info("%s : Starting hotplug driver\n", THUNDERPLUG);
-		tplug_wq = alloc_workqueue("tplug",
-				WQ_HIGHPRI | WQ_FREEZABLE, 0);
-		if (!tplug_wq) {
-			pr_err("%s: Failed to allocate hotplug workqueue\n",
-				__FUNCTION__);
-			tplug_hp_enabled = 0;
-			return 0;
-		}
-		INIT_DELAYED_WORK(&tplug_work, tplug_work_fn);
-		queue_delayed_work_on(0, tplug_wq, &tplug_work,
-					msecs_to_jiffies(sampling_time));
+		thunderplug_start();
 	} else if (tplug_hp_enabled == 1 && last_val == 1) {
 		pr_info("%s : Already Working\n", THUNDERPLUG);
 	} else if (tplug_hp_enabled == 0 && last_val == 0) {
 		pr_info("%s : Already Offline\n", THUNDERPLUG);
 	} else {
-		if (last_val) {
-			flush_workqueue(tplug_wq);
-			cancel_delayed_work_sync(&tplug_work);
-			destroy_workqueue(tplug_wq);
-			pr_info("%s : Stopping hotplug driver\n", THUNDERPLUG);
-		}
+		thunderplug_stop();
 	}
 
 	return count;
@@ -461,11 +443,6 @@ static struct kobj_attribute thunderplug_hotplug_suspend_attribute =
 		0666, thunderplug_hotplug_suspend_show,
 		thunderplug_hotplug_suspend_store);
 
-static struct kobj_attribute thunderplug_suspend_cpus_attribute =
-	__ATTR(suspend_cpus,
-		0666, thunderplug_suspend_cpus_show,
-		thunderplug_suspend_cpus_store);
-
 static struct kobj_attribute thunderplug_max_core_online_attribute =
 	__ATTR(max_core_online,
 		0666, thunderplug_max_core_online_show,
@@ -489,7 +466,6 @@ static struct kobj_attribute thunderplug_load_attribute =
 static struct attribute *thunderplug_attrs[] = {
 	&thunderplug_ver_attribute.attr,
 	&thunderplug_hotplug_suspend_attribute.attr,
-	&thunderplug_suspend_cpus_attribute.attr,
 	&thunderplug_max_core_online_attribute.attr,
 	&thunderplug_min_core_online_attribute.attr,
 	&thunderplug_sampling_attribute.attr,
@@ -503,41 +479,17 @@ static struct attribute_group thunderplug_attr_group =
 	.attrs = thunderplug_attrs,
 };
 
-static struct kobject *thunderplug_kobj;
-
-static int __init thunderplug_init(void)
+static int __ref thunderplug_start(void)
 {
 	int ret = 0;
-	int sysfs_result;
 
-	printk(KERN_DEBUG "[%s]\n",__func__);
-
-	thunderplug_kobj = kobject_create_and_add("thunderplug", kernel_kobj);
-	if (!thunderplug_kobj) {
-		pr_err("%s Interface create failed!\n",
-				__FUNCTION__);
-		return -ENOMEM;
-	}
-
-	sysfs_result = sysfs_create_group(thunderplug_kobj,
-			&thunderplug_attr_group);
-	if (sysfs_result) {
-		pr_info("%s sysfs create failed!\n", __FUNCTION__);
-		kobject_put(thunderplug_kobj);
-	}
-
-	if (tplug_hp_enabled) {
-		tplug_wq = alloc_workqueue("tplug",
-				WQ_HIGHPRI | WQ_FREEZABLE, 0);
-		if (!tplug_wq) {
-			pr_err("%s: Failed to allocate hotplug workqueue\n",
-				__FUNCTION__);
-			ret = -ENOMEM;
-			goto err_out;
-		}
-		INIT_DELAYED_WORK(&tplug_work, tplug_work_fn);
-		queue_delayed_work_on(0, tplug_wq, &tplug_work,
-					msecs_to_jiffies(STARTDELAY));
+	tplug_wq = alloc_workqueue("tplug",
+			WQ_HIGHPRI | WQ_FREEZABLE, 0);
+	if (!tplug_wq) {
+		pr_err("%s: Failed to allocate hotplug workqueue\n",
+			__FUNCTION__);
+		ret = -ENOMEM;
+		goto err_out;
 	}
 
 #ifdef CONFIG_STATE_NOTIFIER
@@ -545,22 +497,74 @@ static int __init thunderplug_init(void)
 	if (state_register_client(&thunder_state_notif)) {
 		pr_err("%s: Failed to register State notifier callback\n",
 			__func__);
-		goto err_out;
+		goto err_dev;
 	}
 #endif
 
-	pr_info("%s: init\n", THUNDERPLUG);
+	INIT_DELAYED_WORK(&tplug_work, tplug_work_fn);
+	for_each_possible_cpu(cpu) {
+		dl = &per_cpu(lock_info, cpu);
+		INIT_DELAYED_WORK(&dl->lock_rem, remove_down_lock);
+	}
+
+	/* Put all sibling cores to sleep to release all locks */
+	cpus_bring_offline(0);
+	cpus_bring_online(0);
+
+	queue_delayed_work_on(0, tplug_wq, &tplug_work,
+				msecs_to_jiffies(START_DELAY));
 
 	return ret;
-
+err_dev:
+	destroy_workqueue(tplug_wq);
 err_out:
 	tplug_hp_enabled = 0;
-	destroy_workqueue(tplug_wq);
-
 	return ret;
 }
 
-MODULE_LICENSE("GPL and additional rights");
+static void thunderplug_stop(void)
+{
+	int cpu;
+	struct down_lock *dl;
+
+	for_each_possible_cpu(cpu) {
+		dl = &per_cpu(lock_info, cpu);
+		cancel_delayed_work_sync(&dl->lock_rem);
+	}
+	flush_workqueue(tplug_wq);
+	cancel_delayed_work_sync(&tplug_work);
+#ifdef CONFIG_STATE_NOTIFIER
+	state_unregister_client(&thunder_state_notif);
+#endif
+	thunder_state_notif.notifier_call = NULL;
+
+	destroy_workqueue(tplug_wq);
+
+	cpus_bring_offline(0);
+}
+
+static void __init thunderplug_init(void)
+{
+	int rc = sysfs_create_group(kernel_kobj, 
+			&thunderplug_attr_group);
+
+	if (tplug_hp_enabled)
+		thunderplug_start();
+
+	return 0;
+}
+
+static void __exit thunderplug_exit(void)
+{
+	if (tplug_hp_enabled)
+		thunderplug_stop();
+
+	sysfs_remove_group(kernel_kobj, &thunderplug_attr_group);
+}
+
+late_initcall(thunderplug_init);
+module_exit(thunderplug_exit);
+
 MODULE_AUTHOR("Varun Chitre <varun.chitre15@gmail.com>");
 MODULE_DESCRIPTION("Hotplug driver for ARM SoCs");
-late_initcall(thunderplug_init);
+MODULE_LICENSE("GPLv2");
