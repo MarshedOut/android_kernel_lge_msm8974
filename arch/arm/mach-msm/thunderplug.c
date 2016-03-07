@@ -171,10 +171,6 @@ static ssize_t __ref thunderplug_max_core_online_store(struct kobject *kobj,
 
 	if (thunder_param.min_core_online > val) {
 		thunder_param.min_core_online = val;
-	} else if (thunder_param.tplug_hp_enabled || val <= NR_CPUS) {
-		thunder_param.max_core_online = val;
-		cpus_bring_offline();
-		cpus_bring_online();
 	}
 
 	thunder_param.min_core_online = val;
@@ -201,10 +197,6 @@ static ssize_t __ref thunderplug_min_core_online_store(struct kobject *kobj,
 
 	if (thunder_param.max_core_online < val) {
 		thunder_param.max_core_online = val;
-	} else if (thunder_param.tplug_hp_enabled || val <= NR_CPUS) {
-		thunder_param.min_core_online = val;
-		cpus_bring_offline();
-		cpus_bring_online();
 	}
 
 	thunder_param.min_core_online = val;
