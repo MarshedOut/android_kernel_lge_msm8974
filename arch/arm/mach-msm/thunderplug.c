@@ -42,8 +42,6 @@ static struct notifier_block thunder_state_notif;
 #define DEFAULT_NR_CPUS_BOOSTED		2
 #define MIN_INPUT_INTERVAL		150 * 1000L
 
-static bool isSuspended = false;
-
 static int now[8], last_time[8];
 struct cpufreq_policy old_policy[NR_CPUS];
 static struct workqueue_struct *tplug_wq;
@@ -460,7 +458,7 @@ static void thunder_input_event(struct input_handle *handle, unsigned int type,
 {
 	u64 time_now;
 
-	if (isSuspended)
+	if (state_suspended)
 		return;
 	if (!thunder_param.tplug_hp_enabled)
 		return;
@@ -547,8 +545,7 @@ static struct input_handler thunder_input_handler = {
 #ifdef CONFIG_STATE_NOTIFIER
 static void __ref thunderplug_suspend(void)
 {
-	if (!isSuspended) {
-		isSuspended = true;
+	if (!state_suspended) {
 		flush_workqueue(tplug_wq);
 		cancel_delayed_work_sync(&tplug_work);
 		cpus_bring_offline(1);
@@ -557,8 +554,7 @@ static void __ref thunderplug_suspend(void)
 
 static void __ref thunderplug_resume(void)
 {
-	if (isSuspended) {
-		isSuspended = false;
+	if (state_suspended) {
 		cpus_bring_online(1);
 		queue_delayed_work_on(0, tplug_wq, &tplug_work,
 				msecs_to_jiffies(thunder_param.sampling_time));
