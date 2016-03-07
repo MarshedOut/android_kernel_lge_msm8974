@@ -47,7 +47,6 @@ struct cpufreq_policy old_policy[NR_CPUS];
 static struct workqueue_struct *tplug_wq;
 static struct delayed_work tplug_work;
 
-static unsigned int resStatus;
 static unsigned int last_load[8] = { 0 };
 static u64 last_boost_time;
 
@@ -116,13 +115,13 @@ static void remove_down_lock(struct work_struct *work)
 	dl->locked = 0;
 }
 
-static inline void cpus_bring_offline(void)
+static inline void cpus_bring_offline(unsigned int cond)
 {
 	unsigned int cpu;
 
 	/* Put cores to sleep */
 	for_each_online_cpu(cpu) {
-		if (resStatus)
+		if (cond)
 			if (cpu == 0 || cpu == 1)
 				continue;
 		else
@@ -133,13 +132,13 @@ static inline void cpus_bring_offline(void)
 	dprintk("%s: cpus set offline.\n", THUNDERPLUG);
 }
 
-static inline void cpus_bring_online(void)
+static inline void cpus_bring_online(unsigned int cond)
 {
 	unsigned int cpu;
 
 	/* Fire up sleeping cores */
 	for_each_cpu_not(cpu, cpu_online_mask) {
-		if (!resStatus)
+		if (cond)
 			if (cpu == 0 || cpu == 1)
 				continue;
 		else
@@ -496,18 +495,16 @@ static struct input_handler thunder_input_handler = {
 static void __ref thunderplug_suspend(void)
 {
 	if (!state_suspended) {
-		resStatus = 1;
 		flush_workqueue(tplug_wq);
 		cancel_delayed_work_sync(&tplug_work);
-		cpus_bring_offline();
+		cpus_bring_offline(1);
 	}
 }
 
 static void __ref thunderplug_resume(void)
 {
 	if (state_suspended) {
-		resStatus = 0;
-		cpus_bring_online();
+		cpus_bring_online(1);
 		queue_delayed_work_on(0, tplug_wq, &tplug_work,
 				msecs_to_jiffies(thunder_param.sampling_time));
 	}
@@ -661,8 +658,8 @@ static int __ref thunderplug_start(void)
 	}
 
 	/* Put all sibling cores to sleep to release all locks */
-	cpus_bring_offline();
-	cpus_bring_online();
+	cpus_bring_offline(0);
+	cpus_bring_online(0);
 
 	queue_delayed_work_on(0, tplug_wq, &tplug_work,
 				msecs_to_jiffies(START_DELAY));
@@ -695,7 +692,7 @@ static void thunderplug_stop(void)
 
 	destroy_workqueue(tplug_wq);
 
-	cpus_bring_offline();
+	cpus_bring_offline(0);
 }
 
 static void __init thunderplug_init(void)
