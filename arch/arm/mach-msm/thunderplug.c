@@ -47,6 +47,7 @@ struct cpufreq_policy old_policy[NR_CPUS];
 static struct workqueue_struct *tplug_wq;
 static struct delayed_work tplug_work;
 
+static unsigned int resStatus;
 static unsigned int last_load[8] = { 0 };
 static u64 last_boost_time;
 
@@ -64,7 +65,6 @@ static struct thunder_param_struct {
 	unsigned int target_cpus;
 	u64 boost_lock_dur;
 	u64 last_input;
-	int hotplug_suspend;
 	unsigned int down_lock_dur;
 	unsigned int sampling_time;
 	int max_core_online;
@@ -75,7 +75,6 @@ static struct thunder_param_struct {
 } thunder_param = {
 	.cpus_boosted = DEFAULT_NR_CPUS_BOOSTED,
 	.boost_lock_dur = DEFAULT_BOOST_LOCK_DUR,
-	.hotplug_suspend = 0,
 	.down_lock_dur = DOWN_LOCK_DUR,
 	.max_core_online = NR_CPUS,
 	.min_core_online = 1,
@@ -117,13 +116,13 @@ static void remove_down_lock(struct work_struct *work)
 	dl->locked = 0;
 }
 
-static inline void cpus_bring_offline(unsigned int sus)
+static inline void cpus_bring_offline(void)
 {
 	unsigned int cpu;
 
 	/* Put cores to sleep */
 	for_each_online_cpu(cpu) {
-		if (sus)
+		if (resStatus)
 			if (cpu == 0 || cpu == 1)
 				continue;
 		else
@@ -134,13 +133,13 @@ static inline void cpus_bring_offline(unsigned int sus)
 	dprintk("%s: cpus set offline.\n", THUNDERPLUG);
 }
 
-static inline void cpus_bring_online(unsigned int sus)
+static inline void cpus_bring_online(void)
 {
 	unsigned int cpu;
 
 	/* Fire up sleeping cores */
 	for_each_cpu_not(cpu, cpu_online_mask) {
-		if (sus)
+		if (!resStatus)
 			if (cpu == 0 || cpu == 1)
 				continue;
 		else
@@ -150,34 +149,6 @@ static inline void cpus_bring_online(unsigned int sus)
 		apply_down_lock(cpu);
 	}
 	dprintk("%s: cpus set online.\n", THUNDERPLUG);
-}
-
-static ssize_t thunderplug_hotplug_suspend_show(struct kobject *kobj,
-                        struct kobj_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%d", thunder_param.hotplug_suspend);
-}
-
-static ssize_t thunderplug_hotplug_suspend_store(struct kobject *kobj,
-			struct kobj_attribute *attr,
-			const char *buf, size_t count)
-{
-	int val;
-
-	sscanf(buf, "%d", &val);
-
-	switch(val) {
-		case 0:
-		case 1:
-			thunder_param.hotplug_suspend = val;
-			break;
-		default:
-			dprintk("%s: invalid value, use 1 or 0.\n",
-					THUNDERPLUG);
-			thunder_param.hotplug_suspend = 0;
-			break;
-	}
-	return count;
 }
 
 static ssize_t thunderplug_max_core_online_show(struct kobject *kobj,
@@ -190,27 +161,23 @@ static ssize_t __ref thunderplug_max_core_online_store(struct kobject *kobj,
 			struct kobj_attribute *attr,
 			const char *buf, size_t count)
 {
-	int val;
+	unsigned int val;
 
-	sscanf(buf, "%d", &val);
-
-	switch(val) {
-		case 1:
-		case 2:
-		case 3:
-		case 4:
-			if (thunder_param.tplug_hp_enabled &&
-					thunder_param.max_core_online != val) {
-				thunder_param.max_core_online = val;
-				cpus_bring_offline(0);
-				cpus_bring_online(0);
-			}
-			break;
-		default:
-			pr_info("%s: invalid max_core value\n",
+	int ret = sscanf(buf, "%u", &val);
+	if (ret != 1 || val < 1 || val > NR_CPUS)
+		pr_info("%s: invalid min_core value\n",
 				THUNDERPLUG);
-			break;
+		return -EINVAL;
+
+	if (thunder_param.min_core_online > val) {
+		thunder_param.min_core_online = val;
+	} else if (thunder_param.tplug_hp_enabled || val <= NR_CPUS) {
+		thunder_param.max_core_online = val;
+		cpus_bring_offline();
+		cpus_bring_online();
 	}
+
+	thunder_param.min_core_online = val;
 	return count;
 }
 
@@ -224,27 +191,23 @@ static ssize_t __ref thunderplug_min_core_online_store(struct kobject *kobj,
                         struct kobj_attribute *attr,
                         const char *buf, size_t count)
 {
-	int val;
+	unsigned int val;
 
-	sscanf(buf, "%d", &val);
-
-	switch(val) {
-		case 1:
-		case 2:
-		case 3:
-		case 4:
-			if (thunder_param.tplug_hp_enabled &&
-					thunder_param.min_core_online != val) {
-				thunder_param.min_core_online = val;
-				cpus_bring_offline(0);
-				cpus_bring_online(0);
-			}
-			break;
-		default:
-			pr_info("%s: invalid min_core value\n",
+	int ret = sscanf(buf, "%u", &val);
+	if (ret != 1 || val < 1 || val > NR_CPUS)
+		pr_info("%s: invalid min_core value\n",
 				THUNDERPLUG);
-			break;
+		return -EINVAL;
+
+	if (thunder_param.max_core_online < val) {
+		thunder_param.max_core_online = val;
+	} else if (thunder_param.tplug_hp_enabled || val <= NR_CPUS) {
+		thunder_param.min_core_online = val;
+		cpus_bring_offline();
+		cpus_bring_online();
 	}
+
+	thunder_param.min_core_online = val;
 	return count;
 }
 
@@ -299,10 +262,9 @@ static ssize_t thunderplug_boost_lock_duration_store(struct kobject *kobj,
 			struct kobj_attribute *attr,
 			const char *buf, size_t count)
 {
-	int ret;
 	u64 val;
 
-	ret = sscanf(buf, "%llu", &val);
+	int ret = sscanf(buf, "%llu", &val);
 	if (ret != 1)
 		return -EINVAL;
 
@@ -321,10 +283,9 @@ static ssize_t thunderplug_cpus_boosted_store(struct kobject *kobj,
 			struct kobj_attribute *attr,
 			const char *buf, size_t count)
 {
-	int ret;
 	unsigned int val;
 
-	ret = sscanf(buf, "%u", &val);
+	int ret = sscanf(buf, "%u", &val);
 	if (ret != 1 || val < 1 || val > NR_CPUS)
 		return -EINVAL;
 
@@ -335,14 +296,13 @@ static ssize_t thunderplug_cpus_boosted_store(struct kobject *kobj,
 
 static unsigned int get_curr_load(unsigned int cpu)
 {
-	int ret;
 	unsigned int idle_time, wall_time;
 	unsigned int cur_load;
 	u64 cur_wall_time, cur_idle_time;
 	struct cpu_load_data *pcpu = &per_cpu(cpuload, cpu);
 	struct cpufreq_policy policy;
 
-	ret = cpufreq_get_policy(&policy, cpu);
+	int ret = cpufreq_get_policy(&policy, cpu);
 	if (ret)
 		return -EINVAL;
 
@@ -418,7 +378,7 @@ static void __cpuinit tplug_work_fn(struct work_struct *work)
 			}
 		}
 	}
-	reschedule:
+reschedule:
 	queue_delayed_work_on(0, tplug_wq, &tplug_work,
 			msecs_to_jiffies(thunder_param.sampling_time));
 }
@@ -458,9 +418,7 @@ static void thunder_input_event(struct input_handle *handle, unsigned int type,
 {
 	u64 time_now;
 
-	if (state_suspended)
-		return;
-	if (!thunder_param.tplug_hp_enabled)
+	if (!thunder_param.tplug_hp_enabled || state_suspended)
 		return;
 
 	time_now = ktime_to_us(ktime_get());
@@ -546,16 +504,18 @@ static struct input_handler thunder_input_handler = {
 static void __ref thunderplug_suspend(void)
 {
 	if (!state_suspended) {
+		resStatus = 1;
 		flush_workqueue(tplug_wq);
 		cancel_delayed_work_sync(&tplug_work);
-		cpus_bring_offline(1);
+		cpus_bring_offline();
 	}
 }
 
 static void __ref thunderplug_resume(void)
 {
 	if (state_suspended) {
-		cpus_bring_online(1);
+		resStatus = 0;
+		cpus_bring_online();
 		queue_delayed_work_on(0, tplug_wq, &tplug_work,
 				msecs_to_jiffies(thunder_param.sampling_time));
 	}
@@ -564,7 +524,7 @@ static void __ref thunderplug_resume(void)
 static int state_notifier_callback(struct notifier_block *this,
 				unsigned long event, void *data)
 {
-	if (!thunder_param.hotplug_suspend || !thunder_param.tplug_hp_enabled)
+	if (!thunder_param.tplug_hp_enabled)
 		return NOTIFY_OK;
 
 	switch (event) {
@@ -591,31 +551,21 @@ static ssize_t __ref thunderplug_hp_enabled_store(struct kobject *kobj,
 			struct kobj_attribute *attr,
 			const char *buf, size_t count)
 {
-	int val, last_val;
+	unsigned int val;
 
-	sscanf(buf, "%d", &val);
+	int ret = sscanf(buf, "%d", &val);
+	if (ret != 1 || val < 0 || val > 1)
+		return -EINVAL;
 
-	last_val = thunder_param.tplug_hp_enabled;
-	switch(val) {
-		case 0:
-		case 1:
-			thunder_param.tplug_hp_enabled = val;
-			break;
-		default:
-			pr_info("%s : invalid option set to hotplug enable\n",
-				THUNDERPLUG);
-			break;
-	}
+	if (val == thunder_param.tplug_hp_enabled)
+		return count;
 
-	if (thunder_param.tplug_hp_enabled == 1 && !last_val) {
+	thunder_param.tplug_hp_enabled = val;
+
+	if (thunder_param.tplug_hp_enabled)
 		thunderplug_start();
-	} else if (thunder_param.tplug_hp_enabled == 1 && last_val == 1) {
-		pr_info("%s : Already Working\n", THUNDERPLUG);
-	} else if (thunder_param.tplug_hp_enabled == 0 && last_val == 0) {
-		pr_info("%s : Already Offline\n", THUNDERPLUG);
-	} else {
+	else
 		thunderplug_stop();
-	}
 
 	return count;
 }
@@ -635,11 +585,6 @@ static ssize_t thunderplug_ver_show(struct kobject *kobj,
 static struct kobj_attribute thunderplug_ver_attribute =
 	__ATTR(version,
 		0444, thunderplug_ver_show, NULL);
-
-static struct kobj_attribute thunderplug_hotplug_suspend_attribute =
-	__ATTR(hotplug_suspend,
-		0666, thunderplug_hotplug_suspend_show,
-		thunderplug_hotplug_suspend_store);
 
 static struct kobj_attribute thunderplug_max_core_online_attribute =
 	__ATTR(max_core_online,
@@ -673,7 +618,6 @@ static struct kobj_attribute thunderplug_cpus_boosted_attribute =
 
 static struct attribute *thunderplug_attrs[] = {
 	&thunderplug_ver_attribute.attr,
-	&thunderplug_hotplug_suspend_attribute.attr,
 	&thunderplug_max_core_online_attribute.attr,
 	&thunderplug_min_core_online_attribute.attr,
 	&thunderplug_sampling_attribute.attr,
@@ -725,8 +669,8 @@ static int __ref thunderplug_start(void)
 	}
 
 	/* Put all sibling cores to sleep to release all locks */
-	cpus_bring_offline(0);
-	cpus_bring_online(0);
+	cpus_bring_offline();
+	cpus_bring_online();
 
 	queue_delayed_work_on(0, tplug_wq, &tplug_work,
 				msecs_to_jiffies(START_DELAY));
@@ -759,7 +703,7 @@ static void thunderplug_stop(void)
 
 	destroy_workqueue(tplug_wq);
 
-	cpus_bring_offline(0);
+	cpus_bring_offline();
 }
 
 static void __init thunderplug_init(void)
