@@ -333,9 +333,6 @@ static void __cpuinit tplug_work_fn(struct work_struct *work)
 		last_load[i] = load[i];
 	}
 
-	/* count online cores */
-	nr_cpu_online = num_online_cpus();
-
 	for (i = 0 ; i < thunder_param.max_core_online - 1; i++) {
 		if (cpu_online(i) && avg_load[i] >
 				thunder_param.load_threshold && cpu_is_offline(i + 1)) {
@@ -347,6 +344,7 @@ static void __cpuinit tplug_work_fn(struct work_struct *work)
 		} else if (cpu_online(i) && avg_load[i] <
 				thunder_param.load_threshold && cpu_online(i + 1)) {
 			dprintk("%s : offlining cpu%d\n", THUNDERPLUG, i);
+			nr_cpu_online = num_online_cpus();
 			if (nr_cpu_online >= thunder_param.min_core_online) {
 				/*
 				 * check if core touch boosted
