@@ -183,8 +183,8 @@ static ssize_t thunderplug_min_core_online_show(struct kobject *kobj,
 }
 
 static ssize_t __ref thunderplug_min_core_online_store(struct kobject *kobj,
-                        struct kobj_attribute *attr,
-                        const char *buf, size_t count)
+			struct kobj_attribute *attr,
+			const char *buf, size_t count)
 {
 	unsigned int val;
 
@@ -404,8 +404,8 @@ static void online_cpu(unsigned int target)
 	queue_work_on(0, tplug_wq, &thunder_param.up_work);
 }
 
-static void thunder_input_event(struct input_handle *handle, unsigned int type,
-				unsigned int code, int value)
+static void thunder_input_event(struct input_handle *handle, 
+				unsigned int type, unsigned int code, int value)
 {
 	u64 time_now;
 
