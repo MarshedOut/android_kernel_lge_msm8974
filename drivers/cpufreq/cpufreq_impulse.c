@@ -395,8 +395,16 @@ static void cpufreq_impulse_timer(unsigned long data)
 	do_div(cputime_speedadj, delta_time);
 	loadadjfreq = (unsigned int)cputime_speedadj * 100;
 	cpu_load = loadadjfreq / pcpu->policy->cur;
-	boosted = check_cpuboost(data) || cpu_load >= go_hispeed_load ||
-				!state_suspended;
+	boosted = cpu_load >= go_hispeed_load;
+#ifdef CONFIG_CPU_BOOST
+	boosted = check_cpuboost(data) || boosted;
+#endif			
+#ifdef CONFIG_MSM_HOTPLUG
+	boosted = fast_lane_mode || boosted;
+#endif
+#ifdef CONFIG_STATE_NOTIFIER
+	boosted = boosted && !state_suspended;
+#endif
 	this_hispeed_freq = max(hispeed_freq, pcpu->policy->min);
 
 	if (cpu_load >= go_hispeed_load || boosted) {
@@ -576,7 +584,11 @@ static int cpufreq_impulse_speedchange_task(void *data)
 			}
 
 			if (max_freq != pcpu->policy->cur) {
-				if (powersave_bias || state_suspended)
+#ifdef CONFIG_STATE_NOTIFIER
+				if (>powersave_bias || state_suspended)
+#else
+				if (powersave_bias)
+#endif
 					__cpufreq_driver_target(pcpu->policy,
 								max_freq,
 								CPUFREQ_RELATION_C);
