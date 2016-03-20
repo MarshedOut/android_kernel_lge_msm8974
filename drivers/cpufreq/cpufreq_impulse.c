@@ -585,7 +585,7 @@ static int cpufreq_impulse_speedchange_task(void *data)
 
 			if (max_freq != pcpu->policy->cur) {
 #ifdef CONFIG_STATE_NOTIFIER
-				if (>powersave_bias || state_suspended)
+				if (powersave_bias || state_suspended)
 #else
 				if (powersave_bias)
 #endif
