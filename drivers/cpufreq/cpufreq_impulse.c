@@ -101,7 +101,7 @@ static unsigned int default_above_hispeed_delay[] = {
 static spinlock_t above_hispeed_delay_lock;
 static unsigned int *above_hispeed_delay = default_above_hispeed_delay;
 static int nabove_hispeed_delay = ARRAY_SIZE(default_above_hispeed_delay);
-bool boosted;
+static bool boosted;
 
 /*
  * Max additional time to wait in idle, beyond timer_rate, at speeds above
