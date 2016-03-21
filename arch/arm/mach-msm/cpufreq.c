@@ -24,7 +24,6 @@
 #include <linux/completion.h>
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
-#include <linux/sched.h>
 #include <linux/suspend.h>
 #include <linux/clk.h>
 #include <linux/err.h>
@@ -71,26 +70,12 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq,
 			unsigned int index)
 {
 	int ret = 0;
-	int saved_sched_policy = -EINVAL;
-	int saved_sched_rt_prio = -EINVAL;
 	struct cpufreq_freqs freqs;
-	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
 	unsigned long rate;
 
 	freqs.old = policy->cur;
 	freqs.new = new_freq;
 	freqs.cpu = policy->cpu;
-
-	/*
-	 * Put the caller into SCHED_FIFO priority to avoid cpu starvation
-	 * while increasing frequencies
-	 */
-
-	if (freqs.new > freqs.old && current->policy != SCHED_FIFO) {
-		saved_sched_policy = current->policy;
-		saved_sched_rt_prio = current->rt_priority;
-		sched_setscheduler_nocheck(current, SCHED_FIFO, &param);
-	}
 
 	cpufreq_notify_transition(&freqs, CPUFREQ_PRECHANGE);
 
@@ -103,11 +88,6 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq,
 		trace_cpu_frequency_switch_end(policy->cpu);
 	}
 
-	/* Restore priority after clock ramp-up */
-	if (freqs.new > freqs.old && saved_sched_policy >= 0) {
-		param.sched_priority = saved_sched_rt_prio;
-		sched_setscheduler_nocheck(current, saved_sched_policy, &param);
-	}
 	return ret;
 }
 
@@ -125,12 +105,15 @@ static int msm_cpufreq_target(struct cpufreq_policy *policy,
 				unsigned int target_freq,
 				unsigned int relation)
 {
-	int ret = -EFAULT;
+	int ret = 0;
 	int index;
 	struct cpufreq_frequency_table *table;
 	struct cpufreq_work_struct *cpu_work = NULL;
 
 	mutex_lock(&per_cpu(cpufreq_suspend, policy->cpu).suspend_mutex);
+
+	if (target_freq == policy->cur)
+		goto done;
 
 	if (per_cpu(cpufreq_suspend, policy->cpu).device_suspended) {
 		pr_debug("cpufreq: cpu%d scheduling frequency change "
@@ -140,6 +123,12 @@ static int msm_cpufreq_target(struct cpufreq_policy *policy,
 	}
 
 	table = cpufreq_frequency_get_table(policy->cpu);
+	if (!table) {
+		pr_err("cpufreq: Failed to get frequency table for CPU%u\n",
+		       policy->cpu);
+		ret = -ENODEV;
+		goto done;
+	}
 	if (cpufreq_frequency_table_target(policy, table, target_freq, relation,
 			&index)) {
 		pr_err("cpufreq: invalid target_freq: %d\n", target_freq);
@@ -186,13 +175,9 @@ static int __cpuinit msm_cpufreq_init(struct cpufreq_policy *policy)
 	int cur_freq;
 	int index;
 	int ret = 0;
-	struct cpufreq_frequency_table *table;
+	struct cpufreq_frequency_table *table = freq_table;
 	struct cpufreq_work_struct *cpu_work = NULL;
 	int cpu;
-
-	table = cpufreq_frequency_get_table(policy->cpu);
-	if (table == NULL)
-		return -ENODEV;
 
  	/*
 	 * In some SoC, some cores are clocked by same source, and their
@@ -200,13 +185,14 @@ static int __cpuinit msm_cpufreq_init(struct cpufreq_policy *policy)
 	 * CPUs that share same clock, and mark them as controlled by
 	 * same policy.
 	 */
-	for_each_possible_cpu(cpu)
-		if (cpu_clk[cpu] == cpu_clk[policy->cpu])
+	for_each_possible_cpu(cpu) {
+		if (cpu_clk[cpu] == cpu_clk[policy->cpu]) {
 			cpumask_set_cpu(cpu, policy->cpus);
-
-	cpu_work = &per_cpu(cpufreq_work, policy->cpu);
-	INIT_WORK(&cpu_work->work, set_cpu_work);
-	init_completion(&cpu_work->complete);
+			cpu_work = &per_cpu(cpufreq_work, cpu);
+			INIT_WORK(&cpu_work->work, set_cpu_work);
+			init_completion(&cpu_work->complete);
+		}
+	}
 
 	if (cpufreq_frequency_table_cpuinfo(policy, table))
 		pr_err("cpufreq: failed to get policy min/max\n");
@@ -231,6 +217,7 @@ static int __cpuinit msm_cpufreq_init(struct cpufreq_policy *policy)
 	pr_debug("cpufreq: cpu%d init at %d switching to %d\n",
 			policy->cpu, cur_freq, table[index].frequency);
 	policy->cur = table[index].frequency;
+	cpufreq_frequency_table_get_attr(table, policy->cpu);
 
 	return 0;
 }
@@ -246,13 +233,18 @@ static int __cpuinit msm_cpufreq_cpu_callback(struct notifier_block *nfb,
 		return NOTIFY_BAD;
 
 	switch (action & ~CPU_TASKS_FROZEN) {
+
+	case CPU_DYING:
+		clk_disable(cpu_clk[cpu]);
+		clk_disable(l2_clk);
+		break;
 	/*
 	 * Scale down clock/power of CPU that is dead and scale it back up
 	 * before the CPU is brought up.
 	 */
 	case CPU_DEAD:
-		clk_disable_unprepare(cpu_clk[cpu]);
-		clk_disable_unprepare(l2_clk);
+		clk_unprepare(cpu_clk[cpu]);
+		clk_unprepare(l2_clk);
 		break;
 	case CPU_UP_CANCELED:
 		clk_unprepare(cpu_clk[cpu]);
@@ -304,13 +296,17 @@ static int msm_cpufreq_suspend(void)
 
 static int msm_cpufreq_resume(void)
 {
-	int cpu, ret;
+	int cpu;
+#ifndef CONFIG_CPU_BOOST
+	int ret;
 	struct cpufreq_policy policy;
+#endif
 
 	for_each_possible_cpu(cpu) {
 		per_cpu(cpufreq_suspend, cpu).device_suspended = 0;
 	}
 
+#ifndef CONFIG_CPU_BOOST
 	/*
 	 * Freq request might be rejected during suspend, resulting
 	 * in policy->cur violating min/max constraint.
@@ -332,6 +328,7 @@ static int msm_cpufreq_resume(void)
 				cpu);
 	}
 	put_online_cpus();
+#endif
 
 	return NOTIFY_DONE;
 }
@@ -529,10 +526,6 @@ static int __init msm_cpufreq_probe(struct platform_device *pdev)
 	ret = cpufreq_parse_dt(dev);
 	if (ret)
 		return ret;
-
-	for_each_possible_cpu(cpu) {
-		cpufreq_frequency_table_get_attr(freq_table, cpu);
-	}
 
 	return 0;
 }
