@@ -91,8 +91,12 @@ static unsigned long min_sample_time = DEFAULT_MIN_SAMPLE_TIME;
 /*
  * The sample rate of the timer used to increase frequency
  */
-#define DEFAULT_TIMER_RATE (20 * USEC_PER_MSEC)
+#define DEFAULT_TIMER_RATE ((unsigned long)(20 * USEC_PER_MSEC))
 static unsigned long timer_rate = DEFAULT_TIMER_RATE;
+
+#ifdef CONFIG_STATE_NOTIFIER
+#define DEFAULT_TIMER_RATE_SUSP ((unsigned long)(50 * USEC_PER_MSEC))
+#endif
 
 /*
  * Wait this long before raising speed above hispeed, by default a single
@@ -390,6 +394,13 @@ static void cpufreq_impulse_timer(unsigned long data)
 	cputime_speedadj = pcpu->cputime_speedadj;
 	pcpu->last_evaluated_jiffy = get_jiffies_64();
 	spin_unlock_irqrestore(&pcpu->load_lock, flags);
+
+#ifdef CONFIG_STATE_NOTIFIER
+	if (state_suspended || powersave_bias)
+		timer_rate = max(timer_rate, DEFAULT_TIMER_RATE_SUSP);
+	else
+		timer_rate = min(timer_rate, DEFAULT_TIMER_RATE_SUSP);
+#endif
 
 	if (WARN_ON_ONCE(!delta_time))
 		goto rearm;
@@ -923,7 +934,7 @@ static ssize_t store_timer_rate(struct kobject *kobj,
 	unsigned long val, val_round;
 
 	ret = kstrtoul(buf, 0, &val);
-	if (ret < 0)
+	if (ret < 0 || val >= 100000)
 		return ret;
 
 	val_round = jiffies_to_usecs(usecs_to_jiffies(val));
