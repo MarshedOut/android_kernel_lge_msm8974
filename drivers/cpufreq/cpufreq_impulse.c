@@ -157,7 +157,6 @@ static void cpufreq_impulse_timer_resched(unsigned long cpu,
 	struct cpufreq_impulse_cpuinfo *pcpu = &per_cpu(cpuinfo, cpu);
 	u64 expires;
 	unsigned long flags;
-	u64 now = ktime_to_us(ktime_get());
 
 	spin_lock_irqsave(&pcpu->load_lock, flags);
 	expires = round_to_nw_start(pcpu->last_evaluated_jiffy);
@@ -194,7 +193,6 @@ static void cpufreq_impulse_timer_start(int cpu)
 	struct cpufreq_impulse_cpuinfo *pcpu = &per_cpu(cpuinfo, cpu);
 	u64 expires = round_to_nw_start(pcpu->last_evaluated_jiffy);
 	unsigned long flags;
-	u64 now = ktime_to_us(ktime_get());
 
 	spin_lock_irqsave(&pcpu->load_lock, flags);
 	pcpu->cpu_timer.expires = expires;
@@ -1163,7 +1161,7 @@ static int cpufreq_governor_impulse(struct cpufreq_policy *policy,
 			spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
 
 			if (policy->min < pcpu->min_freq)
-				cpufreq_interactive_timer_resched(j, true);
+				cpufreq_impulse_timer_resched(j, true);
 			pcpu->min_freq = policy->min;
 
 			up_read(&pcpu->enable_sem);
